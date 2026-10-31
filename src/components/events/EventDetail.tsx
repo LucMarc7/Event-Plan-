@@ -1,0 +1,1410 @@
+// src/components/events/EventDetail.tsx
+import Feather from "@expo/vector-icons/Feather";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import NetInfo from "@react-native-community/netinfo";
+import dayjs from "dayjs";
+import { LinearGradient } from "expo-linear-gradient";
+import { useFocusEffect, useRouter } from "expo-router";
+import { useCallback, useMemo, useRef, useState } from "react";
+import {
+  Animated,
+  Dimensions,
+  Image,
+  Modal,
+  Pressable,
+  ScrollView,
+  Share,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import Toast from "react-native-toast-message";
+
+import { readEvent, supprimerEvent } from "../../api/events";
+import { useDataStore } from "../../stores/data.store";
+import {
+  colors,
+  fontSize,
+  fontWeight,
+  radius,
+  shadows,
+  spacing,
+} from "../../theme/tokens";
+import CustomAlert from "../Alerts/CustomAlert";
+import { DeleteSuccessModal } from "./DeleteSuccessModal";
+
+const CACHE_DURATION = 24 * 60 * 60 * 1000;
+const { height: SCREEN_HEIGHT } = Dimensions.get("window");
+const HERO_HEIGHT = Math.max(SCREEN_HEIGHT * 0.45, 320);
+
+const AnimatedTouchable = Animated.createAnimatedComponent(TouchableOpacity);
+
+const SECTION_COLORS = {
+  address: "#3B82F6",
+  description: "#7C3AED",
+  code: colors.primary,
+  type: "#8B5CF6",
+};
+
+// ═══════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════
+const isImageUrl = (str: any) =>
+  typeof str === "string" &&
+  (str.startsWith("http") ||
+    str.startsWith("/") ||
+    str.startsWith("data:image"));
+
+const findImage = (obj: any, visited = new WeakSet()): string | null => {
+  if (!obj || typeof obj !== "object") return null;
+  if (visited.has(obj)) return null;
+  visited.add(obj);
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const f = findImage(item, visited);
+      if (f) return f;
+    }
+    return null;
+  }
+  const keys = [
+    "image",
+    "cover_image",
+    "event_image",
+    "photo",
+    "banner",
+    "thumbnail",
+    "cover",
+    "image_url",
+    "event_image_url",
+  ];
+  for (const k of keys) {
+    const v = obj[k];
+    if (typeof v === "string" && isImageUrl(v)) return v;
+    if (typeof v === "object" && v) {
+      const n = findImage(v, visited);
+      if (n) return n;
+    }
+  }
+  for (const k in obj) {
+    if (keys.includes(k)) continue;
+    const v = obj[k];
+    if (typeof v === "string" && isImageUrl(v)) return v;
+    if (typeof v === "object" && v) {
+      const n = findImage(v, visited);
+      if (n) return n;
+    }
+  }
+  return null;
+};
+
+const getEventImage = (event: any) => {
+  const raw = (() => {
+    if (event?.image_url && typeof event.image_url === "string") {
+      return event.image_url;
+    }
+    if (event?.event_image && typeof event.event_image === "string") {
+      return event.event_image;
+    }
+    return findImage(event);
+  })();
+  if (!raw) return null;
+  const url = raw.startsWith("/")
+    ? "https://klmarc.pythonanywhere.com" + raw
+    : raw;
+  const stamp =
+    event?.updated_at ||
+    event?.updatedAt ||
+    event?.created_date ||
+    event?.created_at ||
+    "";
+  if (!stamp) return url;
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}v=${encodeURIComponent(String(stamp))}`;
+};
+
+const getEventName = (event: any) =>
+  event?.name ||
+  event?.title ||
+  event?.event_name ||
+  event?.nom ||
+  "Sans titre";
+
+const getEventDate = (event: any) => {
+  const fields = [
+    "date",
+    "start_date",
+    "event_date",
+    "date_event",
+    "created_at",
+  ];
+  for (const f of fields) {
+    const v = event?.[f];
+    if (v) {
+      const d = new Date(v);
+      if (!isNaN(d.getTime())) return d;
+    }
+  }
+  return null;
+};
+
+const getEventLocation = (event: any) =>
+  event?.location ||
+  event?.place ||
+  event?.venue ||
+  event?.address ||
+  event?.lieu ||
+  null;
+
+const getTypeFolder = (event: any): string => {
+  const type = String(event?.type || event?.category || "")
+    .toLowerCase()
+    .trim();
+  if (type === "concert") return "concert";
+  if (type === "conference" || type === "conférence") return "conference";
+  if (type === "birthday" || type === "anniversaire") return "birthday";
+  return "wedding";
+};
+
+const getEventTypeLabel = (event: any): string => {
+  const raw =
+    (typeof event?.category === "string" && event.category) ||
+    event?.category?.name ||
+    (Array.isArray(event?.categories) &&
+      (typeof event.categories[0] === "string"
+        ? event.categories[0]
+        : event.categories[0]?.name)) ||
+    event?.type ||
+    "";
+  const key = String(raw).toLowerCase().trim();
+  const map: Record<string, string> = {
+    wedding: "Mariage",
+    mariage: "Mariage",
+    birthday: "Anniversaire",
+    anniversaire: "Anniversaire",
+    conference: "Conférence",
+    conférence: "Conférence",
+    concert: "Concert",
+    gala: "Gala",
+  };
+  return map[key] || "Événement";
+};
+
+const formatTime = (v: any): string => {
+  if (!v) return "";
+  if (typeof v === "string") {
+    const m = v.match(/^(\d{1,2}):(\d{2})/);
+    if (m) return `${String(m[1]).padStart(2, "0")}:${m[2]}`;
+    const d = dayjs(v);
+    if (d.isValid() && /\d/.test(v)) return d.format("HH:mm");
+    return v;
+  }
+  return "";
+};
+
+const getEventCode = (event: any, fallbackId?: string | null) => {
+  if (!event) return fallbackId ? String(fallbackId) : null;
+  const candidates = [
+    event.code_event,
+    event.event_code,
+    event.code,
+    event.reference,
+  ];
+  for (const c of candidates) {
+    if (c != null) {
+      const str = String(c).trim();
+      if (str && str !== "undefined" && str !== "null") return str;
+    }
+  }
+  if (fallbackId) {
+    return String(fallbackId).replace(/-/g, "").slice(-6).toUpperCase();
+  }
+  return null;
+};
+
+// ═══════════════════════════════════════════════════════════════
+// SOUS-COMPOSANTS
+// ═══════════════════════════════════════════════════════════════
+const InfoTile = ({
+  icon,
+  iconColor,
+  iconBg,
+  label,
+  value,
+}: {
+  icon: any;
+  iconColor: string;
+  iconBg: string;
+  label: string;
+  value: string;
+}) => (
+  <View style={styles.infoTile}>
+    <View style={[styles.infoTileIcon, { backgroundColor: iconBg }]}>
+      <Feather name={icon} size={14} color={iconColor} />
+    </View>
+    <Text style={styles.infoTileLabel}>{label}</Text>
+    <Text style={styles.infoTileValue} numberOfLines={2}>
+      {value}
+    </Text>
+  </View>
+);
+
+const OptionRow = ({
+  icon,
+  iconColor,
+  iconBg,
+  title,
+  subtitle,
+  onPress,
+  danger,
+}: any) => (
+  <TouchableOpacity
+    style={styles.optionRow}
+    onPress={onPress}
+    activeOpacity={0.7}
+  >
+    <View style={[styles.optionIconBox, { backgroundColor: iconBg }]}>
+      <Feather name={icon} size={18} color={iconColor} />
+    </View>
+    <View style={styles.optionTextBox}>
+      <Text
+        style={[styles.optionTitle, danger && { color: colors.error }]}
+        numberOfLines={1}
+      >
+        {title}
+      </Text>
+      {subtitle ? (
+        <Text style={styles.optionSubtitle} numberOfLines={1}>
+          {subtitle}
+        </Text>
+      ) : null}
+    </View>
+    <Feather
+      name="chevron-right"
+      size={18}
+      color={danger ? colors.error : colors.textMuted}
+    />
+  </TouchableOpacity>
+);
+
+// ═══════════════════════════════════════════════════════════════
+// COMPOSANT PRINCIPAL
+// ═══════════════════════════════════════════════════════════════
+interface EventDetailProps {
+  id: string;
+}
+
+const EventDetail = ({ id }: EventDetailProps) => {
+  const insets = useSafeAreaInsets();
+  const router = useRouter();
+  const CACHE_KEY = `event_${id}`;
+
+  const setDetailEvent = useDataStore((state: any) => state?.setDetailEvent);
+
+  const [event, setEvent] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [networkError, setNetworkError] = useState(false);
+  const [imageError, setImageError] = useState(false);
+  const [sheetVisible, setSheetVisible] = useState(false);
+
+  const [alertModify, setAlertModify] = useState(false);
+  const [alertTheme, setAlertTheme] = useState(false);
+  const [alertPlace, setAlertPlace] = useState(false);
+  const [alertDelete, setAlertDelete] = useState(false);
+  const [alertImage, setAlertImage] = useState(false);
+  const [showDeleteSuccess, setShowDeleteSuccess] = useState(false);
+  const [deletedName, setDeletedName] = useState("");
+
+  const eventRef = useRef<any>(null);
+  const fetchingRef = useRef(false);
+
+  // ─── FAB rétractable ───
+  const scrollY = useRef(new Animated.Value(0)).current;
+
+  const fabWidth = scrollY.interpolate({
+    inputRange: [0, 80, 140],
+    outputRange: [200, 200, 64],
+    extrapolate: "clamp",
+  });
+
+  const fabTextOpacity = scrollY.interpolate({
+    inputRange: [0, 60, 110],
+    outputRange: [1, 0.2, 0],
+    extrapolate: "clamp",
+  });
+
+  const fabTextWidth = scrollY.interpolate({
+    inputRange: [0, 80, 140],
+    outputRange: [120, 120, 0],
+    extrapolate: "clamp",
+  });
+
+  const fabTextMargin = scrollY.interpolate({
+    inputRange: [0, 80, 140],
+    outputRange: [spacing.sm, spacing.sm, 0],
+    extrapolate: "clamp",
+  });
+
+  const fabPadding = scrollY.interpolate({
+    inputRange: [0, 80, 140],
+    outputRange: [spacing.base, spacing.base, 0],
+    extrapolate: "clamp",
+  });
+
+  const fetchEvent = useCallback(
+    async (force = false) => {
+      if (!id) return;
+
+      if (fetchingRef.current) {
+        console.log("⏳ Un fetch est déjà en cours, ignoré");
+        return;
+      }
+
+      fetchingRef.current = true;
+      setLoading(true);
+
+      try {
+        const net = await NetInfo.fetch();
+
+        if (!net.isConnected && !force) {
+          setNetworkError(true);
+          const cached = await AsyncStorage.getItem(CACHE_KEY);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (Date.now() - parsed.timestamp < CACHE_DURATION) {
+              setEvent(parsed.data);
+              eventRef.current = parsed.data;
+              try {
+                setDetailEvent?.(parsed.data);
+              } catch (e) {
+                console.warn("[EventDetail] setDetailEvent failed:", e);
+              }
+            }
+          }
+          setLoading(false);
+          fetchingRef.current = false;
+          return;
+        }
+
+        setNetworkError(false);
+
+        if (force) {
+          await AsyncStorage.removeItem(CACHE_KEY).catch(() => {});
+        }
+
+        const data = await readEvent(String(id));
+        setEvent(data);
+        eventRef.current = data;
+
+        try {
+          setDetailEvent?.(data);
+        } catch (e) {
+          console.warn("[EventDetail] setDetailEvent failed:", e);
+        }
+
+        setImageError(false);
+
+        await AsyncStorage.setItem(
+          CACHE_KEY,
+          JSON.stringify({ data, timestamp: Date.now() }),
+        );
+      } catch (err) {
+        console.warn("[EventDetail] fetchEvent error:", err);
+        try {
+          const cached = await AsyncStorage.getItem(CACHE_KEY);
+          if (cached && !eventRef.current) {
+            const parsed = JSON.parse(cached);
+            setEvent(parsed.data);
+            eventRef.current = parsed.data;
+            try {
+              setDetailEvent?.(parsed.data);
+            } catch (e) {
+              console.warn("[EventDetail] setDetailEvent failed:", e);
+            }
+          }
+        } catch {}
+        setNetworkError(true);
+      } finally {
+        setLoading(false);
+        fetchingRef.current = false;
+      }
+    },
+    [id, CACHE_KEY, setDetailEvent],
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      console.log("[EventDetail] focus → fetchEvent(true)");
+      fetchEvent(true);
+      return () => {
+        console.log("[EventDetail] blur");
+      };
+    }, [fetchEvent]),
+  );
+
+  const eventId = useMemo(
+    () => event?.id ?? event?.uuid ?? event?.event_id ?? id,
+    [event, id],
+  );
+  const eventName = useMemo(() => getEventName(event), [event]);
+  const eventType = useMemo(() => getEventTypeLabel(event), [event]);
+  const eventImage = useMemo(() => getEventImage(event), [event]);
+  const eventLocation = useMemo(() => getEventLocation(event), [event]);
+  const eventDate = useMemo(() => getEventDate(event), [event]);
+  const eventCode = useMemo(
+    () => getEventCode(event, eventId),
+    [event, eventId],
+  );
+
+  const date = eventDate ? dayjs(eventDate) : null;
+  const timeStart = formatTime(event?.heure_debut || event?.start_time);
+  const timeEnd = formatTime(event?.heure_fin || event?.end_time);
+  const timeDisplay =
+    timeStart && timeEnd
+      ? `${timeStart} – ${timeEnd}`
+      : timeStart || timeEnd || "—";
+
+  const handleScroll = Animated.event(
+    [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+    { useNativeDriver: false },
+  );
+
+  const handleShare = async () => {
+    if (!event) return;
+    try {
+      await Share.share({
+        message: `Venez assister à ${eventName} le ${
+          date?.format("DD/MM/YY") || ""
+        }.`,
+      });
+    } catch {}
+  };
+
+  // ✅ MODIFIÉ — suppression → popup de succès + choix utilisateur
+  const handleDelete = async () => {
+    setAlertDelete(false);
+    try {
+      const category = event?.category || "mariage";
+      await supprimerEvent(eventId, category);
+      await AsyncStorage.removeItem(CACHE_KEY);
+      setDeletedName(eventName);
+      setShowDeleteSuccess(true);
+    } catch {
+      Toast.show({ type: "error", text1: "Erreur lors de la suppression" });
+    }
+  };
+
+  const handleCopyCode = async () => {
+    if (!eventCode) return;
+    try {
+      const Clipboard = require("expo-clipboard");
+      await Clipboard.setStringAsync(eventCode);
+      Toast.show({ type: "success", text1: `Code ${eventCode} copié` });
+    } catch {}
+  };
+
+  const goToGuests = () => {
+    router.push({
+      pathname: "/guests/[eventId]",
+      params: { eventId: String(eventId) },
+    });
+  };
+
+  if (loading && !event) {
+    return (
+      <View style={styles.center}>
+        <Text style={styles.loadingText}>Chargement…</Text>
+      </View>
+    );
+  }
+
+  if (!event) {
+    return (
+      <View style={styles.center}>
+        <Feather name="alert-circle" size={40} color={colors.error} />
+        <Text style={styles.errorTitle}>Impossible de charger l'événement</Text>
+        {networkError ? (
+          <Text style={styles.errorSub}>Vérifiez votre connexion</Text>
+        ) : null}
+        <TouchableOpacity
+          style={styles.retryBtn}
+          onPress={() => fetchEvent(true)}
+        >
+          <Text style={styles.retryText}>Réessayer</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  return (
+    <>
+      <StatusBar
+        barStyle="light-content"
+        translucent
+        backgroundColor="transparent"
+      />
+      <View style={styles.container}>
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ paddingBottom: 140 }}
+          onScroll={handleScroll}
+          scrollEventThrottle={16}
+        >
+          {/* HERO */}
+          <View style={[styles.hero, { height: HERO_HEIGHT }]}>
+            {eventImage && !imageError ? (
+              <Image
+                source={{ uri: eventImage }}
+                style={styles.heroImage}
+                resizeMode="cover"
+                onError={() => setImageError(true)}
+                key={eventImage}
+              />
+            ) : (
+              <View style={[styles.heroImage, styles.heroFallback]}>
+                <Feather name="image" size={56} color={colors.textMuted} />
+              </View>
+            )}
+
+            <LinearGradient
+              colors={["rgba(15,23,42,0)", "rgba(15,23,42,0.75)"]}
+              style={styles.heroGradient}
+            />
+
+            <View
+              style={[
+                styles.heroHeader,
+                { paddingTop: insets.top + spacing.sm },
+              ]}
+            >
+              <TouchableOpacity
+                style={styles.heroNavBtn}
+                onPress={() => router.back()}
+                activeOpacity={0.7}
+              >
+                <Feather name="arrow-left" size={20} color="#FFF" />
+              </TouchableOpacity>
+              <View style={{ flexDirection: "row", gap: spacing.sm }}>
+                <TouchableOpacity
+                  style={styles.heroNavBtn}
+                  onPress={handleShare}
+                  activeOpacity={0.7}
+                >
+                  <Feather name="share-2" size={18} color="#FFF" />
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.heroNavBtn}
+                  onPress={() => setSheetVisible(true)}
+                  activeOpacity={0.7}
+                >
+                  <Feather name="more-horizontal" size={20} color="#FFF" />
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <View style={styles.heroContent}>
+              <View style={styles.heroContentRow}>
+                <View style={{ flex: 1 }}>
+                  <View style={styles.heroTypePill}>
+                    <Text style={styles.heroTypeText}>{eventType}</Text>
+                  </View>
+                  <Text style={styles.heroTitle} numberOfLines={2}>
+                    {eventName}
+                  </Text>
+                  <View style={styles.heroMetaRow}>
+                    <Feather
+                      name="calendar"
+                      size={13}
+                      color="rgba(255,255,255,0.85)"
+                    />
+                    <Text style={styles.heroMetaText}>
+                      {date?.format("DD MMM YYYY") || "Date inconnue"}
+                    </Text>
+                  </View>
+                </View>
+
+                <TouchableOpacity
+                  style={styles.heroImageBtn}
+                  onPress={() => setAlertImage(true)}
+                  activeOpacity={0.8}
+                >
+                  <Feather name="image" size={18} color="#FFF" />
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+
+          {/* SHEET */}
+          <View style={styles.sheet}>
+            <View style={styles.sheetHandle} />
+
+            <View style={styles.infoStrip}>
+              <InfoTile
+                icon="calendar"
+                iconColor={colors.primary}
+                iconBg={colors.primarySoft}
+                label="Date"
+                value={date?.format("DD MMM YYYY") || "—"}
+              />
+              <InfoTile
+                icon="clock"
+                iconColor={colors.warning}
+                iconBg={colors.warningSoft}
+                label="Heure"
+                value={timeDisplay}
+              />
+              <InfoTile
+                icon="tag"
+                iconColor={SECTION_COLORS.type}
+                iconBg="#F5F3FF"
+                label="Type"
+                value={eventType}
+              />
+            </View>
+
+            {eventCode ? (
+              <TouchableOpacity
+                style={styles.codeCard}
+                onPress={handleCopyCode}
+                activeOpacity={0.85}
+              >
+                <View
+                  style={[
+                    styles.codeIconBox,
+                    { backgroundColor: SECTION_COLORS.code + "15" },
+                  ]}
+                >
+                  <Feather name="key" size={20} color={SECTION_COLORS.code} />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text
+                    style={[styles.codeLabel, { color: SECTION_COLORS.code }]}
+                  >
+                    CODE DE L'ÉVÉNEMENT
+                  </Text>
+                  <Text style={styles.codeValue}>{eventCode}</Text>
+                </View>
+                <View
+                  style={[
+                    styles.codeCopyBtn,
+                    { backgroundColor: SECTION_COLORS.code + "15" },
+                  ]}
+                >
+                  <Feather name="copy" size={16} color={SECTION_COLORS.code} />
+                </View>
+              </TouchableOpacity>
+            ) : null}
+
+            <View style={styles.section}>
+              <View style={styles.sectionHeader}>
+                <View
+                  style={[
+                    styles.sectionHeaderIcon,
+                    { backgroundColor: SECTION_COLORS.address + "15" },
+                  ]}
+                >
+                  <Feather
+                    name="map-pin"
+                    size={14}
+                    color={SECTION_COLORS.address}
+                  />
+                </View>
+                <Text
+                  style={[
+                    styles.sectionHeaderLabel,
+                    { color: SECTION_COLORS.address },
+                  ]}
+                >
+                  ADRESSE
+                </Text>
+              </View>
+              <View style={styles.sectionBody}>
+                <Text style={styles.sectionText}>
+                  {eventLocation ||
+                    `${event.avenue ? event.avenue + ", " : ""}${
+                      event.commune ? event.commune + ", " : ""
+                    }${event.ville || "Non renseigné"}`}
+                </Text>
+                {event.reference ? (
+                  <View style={styles.refRow}>
+                    <Feather
+                      name="bookmark"
+                      size={11}
+                      color={colors.textMuted}
+                    />
+                    <Text style={styles.refText}>Réf : {event.reference}</Text>
+                  </View>
+                ) : null}
+              </View>
+            </View>
+
+            {event.description ? (
+              <View style={styles.section}>
+                <View style={styles.sectionHeader}>
+                  <View
+                    style={[
+                      styles.sectionHeaderIcon,
+                      { backgroundColor: SECTION_COLORS.description + "15" },
+                    ]}
+                  >
+                    <Feather
+                      name="file-text"
+                      size={14}
+                      color={SECTION_COLORS.description}
+                    />
+                  </View>
+                  <Text
+                    style={[
+                      styles.sectionHeaderLabel,
+                      { color: SECTION_COLORS.description },
+                    ]}
+                  >
+                    DESCRIPTION
+                  </Text>
+                </View>
+                <View style={styles.sectionBody}>
+                  <Text style={styles.sectionText}>{event.description}</Text>
+                </View>
+              </View>
+            ) : null}
+          </View>
+        </ScrollView>
+
+        {/* FAB RÉTRACTABLE */}
+        <Animated.View
+          style={[
+            styles.fabContainer,
+            {
+              width: fabWidth,
+              paddingBottom: insets.bottom + spacing.lg,
+            },
+          ]}
+        >
+          <AnimatedTouchable
+            style={[styles.fabButton, { paddingHorizontal: fabPadding }]}
+            onPress={goToGuests}
+            activeOpacity={0.9}
+          >
+            <Animated.View
+              style={[
+                styles.fabTextWrap,
+                {
+                  width: fabTextWidth,
+                  opacity: fabTextOpacity,
+                  marginRight: fabTextMargin,
+                },
+              ]}
+            >
+              <Text style={styles.fabText} numberOfLines={1}>
+                Voir les invités
+              </Text>
+            </Animated.View>
+            <View style={styles.fabArrow}>
+              <Feather name="arrow-right" size={14} color={colors.primary} />
+            </View>
+          </AnimatedTouchable>
+        </Animated.View>
+      </View>
+
+      {/* BOTTOM SHEET OPTIONS */}
+      <Modal
+        animationType="slide"
+        transparent
+        visible={sheetVisible}
+        onRequestClose={() => setSheetVisible(false)}
+      >
+        <Pressable
+          style={styles.sheetOverlay}
+          onPress={() => setSheetVisible(false)}
+        >
+          <Pressable
+            style={styles.sheetModalContent}
+            onPress={(e) => e.stopPropagation()}
+          >
+            <View style={styles.sheetHandle} />
+            <View style={styles.sheetModalHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.sheetModalTitle}>Options</Text>
+                <Text style={styles.sheetModalSubtitle} numberOfLines={1}>
+                  {eventName}
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={styles.sheetCloseBtn}
+                onPress={() => setSheetVisible(false)}
+              >
+                <Feather name="x" size={18} color={colors.textSecondary} />
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.sheetGroupTitle}>Gérer</Text>
+            <View style={styles.sheetGroup}>
+              <OptionRow
+                icon="edit-2"
+                iconColor={colors.primary}
+                iconBg={colors.primarySoft}
+                title="Modifier l'événement"
+                subtitle="Nom, date, lieu, description"
+                onPress={() => {
+                  setSheetVisible(false);
+                  setAlertModify(true);
+                }}
+              />
+              <View style={styles.sheetSeparator} />
+              <OptionRow
+                icon="sliders"
+                iconColor="#DB2777"
+                iconBg="#FDF2F8"
+                title="Choisir un thème"
+                subtitle="Personnalisez vos invitations"
+                onPress={() => {
+                  setSheetVisible(false);
+                  setAlertTheme(true);
+                }}
+              />
+              <View style={styles.sheetSeparator} />
+              <OptionRow
+                icon="grid"
+                iconColor={colors.warning}
+                iconBg={colors.warningSoft}
+                title="Tables & places"
+                subtitle="Organisez le placement"
+                onPress={() => {
+                  setSheetVisible(false);
+                  setAlertPlace(true);
+                }}
+              />
+            </View>
+
+            <Text style={styles.sheetGroupTitle}>Équipe & accès</Text>
+            <View style={styles.sheetGroup}>
+              <OptionRow
+                icon="users"
+                iconColor={colors.primary}
+                iconBg={colors.primarySoft}
+                title="Contrôleurs d'accès"
+                subtitle="Ajouter, gérer et voir les performances"
+                onPress={() => {
+                  setSheetVisible(false);
+                  router.push({
+                    pathname: "/(main)/controllers/[eventId]",
+                    params: { eventId: String(eventId) },
+                  });
+                }}
+              />
+              <View style={styles.sheetSeparator} />
+              <OptionRow
+                icon="camera"
+                iconColor={colors.success}
+                iconBg={colors.successSoft}
+                title="Ouvrir la caméra"
+                subtitle="Scanner un QR code"
+                onPress={() => {
+                  setSheetVisible(false);
+                  router.push("/camera");
+                }}
+              />
+              <View style={styles.sheetSeparator} />
+              <OptionRow
+                icon="image"
+                iconColor="#8B5CF6"
+                iconBg="#F5F3FF"
+                title="Changer l'image"
+                subtitle="Modifier la photo de couverture"
+                onPress={() => {
+                  setSheetVisible(false);
+                  setAlertImage(true);
+                }}
+              />
+            </View>
+
+            <View style={[styles.sheetGroup, styles.sheetGroupDanger]}>
+              <OptionRow
+                icon="trash-2"
+                iconColor={colors.error}
+                iconBg={colors.errorSoft}
+                title="Supprimer l'événement"
+                subtitle="Récupérable 48h"
+                onPress={() => {
+                  setSheetVisible(false);
+                  setAlertDelete(true);
+                }}
+                danger
+              />
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* DIALOGS */}
+      <CustomAlert
+        visible={alertModify}
+        title="Modifier l'événement"
+        message="Voulez-vous vraiment modifier cet événement ?"
+        onCancel={() => setAlertModify(false)}
+        onConfirm={() => {
+          setAlertModify(false);
+          router.push(`/events/${getTypeFolder(event)}/update/${eventId}`);
+        }}
+      />
+      <CustomAlert
+        visible={alertTheme}
+        title="Choisir un thème"
+        message="Accéder à la galerie de thèmes ?"
+        onCancel={() => setAlertTheme(false)}
+        onConfirm={() => {
+          setAlertTheme(false);
+          router.push({
+            pathname: "/(main)/guests/themes/[eventId]",
+            params: { eventId: String(eventId) },
+          });
+        }}
+      />
+      <CustomAlert
+        visible={alertPlace}
+        title="Tables & places"
+        message="Gérer les tables et places ?"
+        onCancel={() => setAlertPlace(false)}
+        onConfirm={() => setAlertPlace(false)}
+      />
+      <CustomAlert
+        visible={alertDelete}
+        title="Supprimer l'événement"
+        message="Cet événement sera déplacé dans la corbeille. Vous pourrez le récupérer pendant 48h."
+        onCancel={() => setAlertDelete(false)}
+        onConfirm={handleDelete}
+      />
+      <CustomAlert
+        visible={alertImage}
+        title="Changer l'image"
+        message="Voulez-vous modifier l'image de cet événement ?"
+        onCancel={() => setAlertImage(false)}
+        onConfirm={() => {
+          setAlertImage(false);
+          router.push(`/events/wedding/uploader/${eventId}`);
+        }}
+      />
+
+      {/* ✅ NOUVEAU — Modal de succès après suppression */}
+      <DeleteSuccessModal
+        visible={showDeleteSuccess}
+        title="Événement supprimé"
+        message={`« ${deletedName} » a été déplacé dans la corbeille.`}
+        primaryLabel="Retour à l'accueil"
+        onPrimary={() => {
+          setShowDeleteSuccess(false);
+          router.replace("/(main)/home");
+        }}
+        secondaryLabel="Créer un autre événement"
+        onSecondary={() => {
+          setShowDeleteSuccess(false);
+          router.replace("/events/category");
+        }}
+      />
+    </>
+  );
+};
+
+export default EventDetail;
+
+// ═══════════════════════════════════════════════════════════════
+// STYLES (identiques à ton fichier actuel — ne change rien)
+// ═══════════════════════════════════════════════════════════════
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: colors.bg },
+  center: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    padding: spacing.xl,
+    gap: spacing.md,
+    backgroundColor: colors.bg,
+  },
+  loadingText: { color: colors.textSecondary, fontSize: fontSize.sm },
+  errorTitle: {
+    fontSize: fontSize.base,
+    fontWeight: fontWeight.bold,
+    color: colors.text,
+    textAlign: "center",
+  },
+  errorSub: { fontSize: fontSize.sm, color: colors.textSecondary },
+  retryBtn: {
+    backgroundColor: colors.primary,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.xl,
+    borderRadius: radius.pill,
+    marginTop: spacing.md,
+  },
+  retryText: {
+    color: "#FFF",
+    fontWeight: fontWeight.bold,
+    fontSize: fontSize.sm,
+  },
+
+  hero: {
+    width: "100%",
+    position: "relative",
+    overflow: "hidden",
+  },
+  heroImage: {
+    ...StyleSheet.absoluteFillObject,
+    width: "100%",
+    height: "100%",
+  },
+  heroFallback: {
+    backgroundColor: colors.surfaceAlt,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  heroGradient: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: "55%",
+  },
+  heroHeader: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingHorizontal: spacing.lg,
+  },
+  heroNavBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "rgba(15,23,42,0.45)",
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.15)",
+  },
+  heroContent: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.lg,
+  },
+  heroContentRow: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: spacing.md,
+  },
+  heroTypePill: {
+    alignSelf: "flex-start",
+    backgroundColor: "rgba(255,255,255,0.22)",
+    paddingHorizontal: spacing.md,
+    paddingVertical: 4,
+    borderRadius: radius.pill,
+    marginBottom: spacing.sm,
+  },
+  heroTypeText: {
+    fontSize: fontSize.xs,
+    color: "#FFF",
+    fontWeight: fontWeight.bold,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+  },
+  heroTitle: {
+    fontSize: fontSize.xxl,
+    fontWeight: fontWeight.extrabold,
+    color: "#FFF",
+    lineHeight: fontSize.xxl * 1.15,
+  },
+  heroMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: spacing.xs,
+  },
+  heroMetaText: {
+    fontSize: fontSize.sm,
+    color: "rgba(255,255,255,0.9)",
+    fontWeight: fontWeight.medium,
+  },
+  heroImageBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "rgba(15,23,42,0.5)",
+    justifyContent: "center",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.2)",
+  },
+
+  sheet: {
+    backgroundColor: colors.bg,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.xl,
+  },
+  sheetHandle: {
+    width: 44,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: colors.border,
+    alignSelf: "center",
+    marginBottom: spacing.lg,
+  },
+
+  infoStrip: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginBottom: spacing.lg,
+  },
+  infoTile: {
+    flex: 1,
+    alignItems: "center",
+    backgroundColor: colors.surface,
+    borderRadius: radius.lg,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.xs,
+    gap: 2,
+    ...shadows.sm,
+  },
+  infoTileIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: radius.sm,
+    justifyContent: "center",
+    alignItems: "center",
+    marginBottom: spacing.xs,
+  },
+  infoTileLabel: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    fontWeight: fontWeight.bold,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  infoTileValue: {
+    fontSize: fontSize.sm,
+    fontWeight: fontWeight.bold,
+    color: colors.text,
+    textAlign: "center",
+    marginTop: 2,
+  },
+
+  codeCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: colors.surface,
+    borderRadius: radius.xl,
+    paddingVertical: spacing.base,
+    paddingHorizontal: spacing.base,
+    borderWidth: 1.5,
+    borderColor: colors.primarySoft,
+    marginBottom: spacing.lg,
+    ...shadows.md,
+  },
+  codeIconBox: {
+    width: 48,
+    height: 48,
+    borderRadius: radius.md,
+    justifyContent: "center",
+    alignItems: "center",
+    marginRight: spacing.md,
+  },
+  codeLabel: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.bold,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+    marginBottom: 2,
+  },
+  codeValue: {
+    fontSize: fontSize.lg,
+    fontWeight: fontWeight.extrabold,
+    color: colors.text,
+    letterSpacing: 2,
+  },
+  codeCopyBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: radius.md,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+
+  section: {
+    backgroundColor: colors.surface,
+    borderRadius: radius.xl,
+    overflow: "hidden",
+    marginBottom: spacing.lg,
+    ...shadows.sm,
+  },
+  sectionHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
+    backgroundColor: colors.surfaceAlt,
+  },
+  sectionHeaderIcon: {
+    width: 26,
+    height: 26,
+    borderRadius: radius.sm,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  sectionHeaderLabel: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.bold,
+    textTransform: "uppercase",
+    letterSpacing: 0.8,
+  },
+  sectionBody: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
+  },
+  sectionText: {
+    fontSize: fontSize.base,
+    color: colors.textSecondary,
+    lineHeight: 22,
+  },
+  refRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: spacing.sm,
+  },
+  refText: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    fontWeight: fontWeight.medium,
+  },
+
+  fabContainer: {
+    position: "absolute",
+    bottom: 0,
+    right: spacing.lg,
+    paddingTop: spacing.md,
+  },
+  fabButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.primary,
+    height: 56,
+    borderRadius: 16,
+    ...shadows.lg,
+  },
+  fabTextWrap: {
+    overflow: "hidden",
+    justifyContent: "center",
+    alignItems: "flex-start",
+  },
+  fabText: {
+    color: "#FFF",
+    fontSize: fontSize.base,
+    fontWeight: fontWeight.bold,
+  },
+  fabArrow: {
+    width: 40,
+    height: 35,
+    borderRadius: 10,
+    backgroundColor: "#FFF",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+
+  sheetOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(15,23,42,0.55)",
+    justifyContent: "flex-end",
+  },
+  sheetModalContent: {
+    backgroundColor: colors.bg,
+    borderTopLeftRadius: radius.xxl,
+    borderTopRightRadius: radius.xxl,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.sm,
+    paddingBottom: spacing.xl,
+    maxHeight: "85%",
+  },
+  sheetModalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+    marginBottom: spacing.lg,
+  },
+  sheetModalTitle: {
+    fontSize: fontSize.xl,
+    fontWeight: fontWeight.extrabold,
+    color: colors.text,
+  },
+  sheetModalSubtitle: {
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+    marginTop: 2,
+  },
+  sheetCloseBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: colors.surface,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  sheetGroupTitle: {
+    fontSize: fontSize.xs,
+    fontWeight: fontWeight.bold,
+    color: colors.textMuted,
+    textTransform: "uppercase",
+    letterSpacing: 0.8,
+    marginBottom: spacing.sm,
+    paddingHorizontal: spacing.sm,
+  },
+  sheetGroup: {
+    backgroundColor: colors.surface,
+    borderRadius: radius.lg,
+    overflow: "hidden",
+    marginBottom: spacing.lg,
+    ...shadows.sm,
+  },
+  sheetGroupDanger: {
+    borderWidth: 1,
+    borderColor: colors.errorSoft,
+  },
+  sheetSeparator: {
+    height: 1,
+    backgroundColor: colors.borderLight,
+    marginLeft: 62,
+  },
+  optionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
+    gap: spacing.md,
+  },
+  optionIconBox: {
+    width: 40,
+    height: 40,
+    borderRadius: radius.md,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  optionTextBox: { flex: 1 },
+  optionTitle: {
+    fontSize: fontSize.base,
+    fontWeight: fontWeight.semibold,
+    color: colors.text,
+  },
+  optionSubtitle: {
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    marginTop: 2,
+  },
+});

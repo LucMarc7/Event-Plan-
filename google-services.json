@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "152062236404",
+    "project_id": "eventplan-7ab52",
+    "storage_bucket": "eventplan-7ab52.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:152062236404:android:0e726b4911b42d7ceb70a1",
+        "android_client_info": {
+          "package_name": "com.lm.kazadi.EventPlan"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDJx-0prD60j2rZN-R0E6A5gL6qIseH3vM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,315 @@
+// src/api/events.ts
+import api from "./client";
+import { ENDPOINTS } from "./endpoints";
+
+export type EventCategory =
+  | "mariage"
+  | "birthday"
+  | "concert"
+  | "conference"
+  | "default";
+
+export interface NormalizedEvent {
+  id: string;
+  title: string;
+  category: EventCategory;
+  date: string;
+  location: string;
+  description?: string;
+  image_url?: string;
+  event_code?: string;
+  [key: string]: any;
+}
+
+const CATEGORY_TO_ENDPOINT: Record<string, string> = {
+  mariage: "mariages",
+  wedding: "mariages",
+  birthday: "birthdays",
+  anniversaire: "birthdays",
+  concert: "concerts",
+  conference: "events",
+  conférence: "events",
+};
+
+const resolveCategoryEndpoint = (categoryOrType: string): string => {
+  const key = String(categoryOrType || "")
+    .toLowerCase()
+    .trim();
+  return CATEGORY_TO_ENDPOINT[key] || "events";
+};
+
+// ✅ Cache mémoire : eventId → resource legacy qui fonctionne (utilisé par readEvent)
+const workingResourceCache = new Map<string, string>();
+
+const normalizeCategory = (raw: any): EventCategory => {
+  const key = String(raw || "")
+    .toLowerCase()
+    .trim();
+  const map: Record<string, EventCategory> = {
+    mariage: "mariage",
+    wedding: "mariage",
+    birthday: "birthday",
+    anniversaire: "birthday",
+    concert: "concert",
+    conference: "conference",
+    conférence: "conference",
+  };
+  return map[key] || "default";
+};
+
+const normalizeEvent = (event: any): NormalizedEvent => {
+  const rawCategory =
+    event?.category ||
+    event?.type ||
+    event?.event_category ||
+    event?.categories?.[0]?.name ||
+    event?.categories?.[0] ||
+    "";
+
+  return {
+    ...event,
+    id: event?.id ?? event?.uuid ?? event?.event_id ?? event?.pk,
+    title: event?.title || event?.name || event?.event_name || "Sans titre",
+    category: normalizeCategory(rawCategory),
+    date: event?.date || event?.start_date || event?.event_date || "",
+    location:
+      event?.location ||
+      event?.place ||
+      event?.venue ||
+      event?.address ||
+      event?.ville ||
+      "",
+    description: event?.description || "",
+    image_url:
+      event?.image_url ||
+      event?.event_image_url ||
+      event?.event_image ||
+      event?.image ||
+      event?.cover_image ||
+      "",
+    event_code: event?.event_code || event?.code_event || event?.code || "",
+  };
+};
+
+export const getAllEvents = async (
+  _forceRefresh = false,
+): Promise<NormalizedEvent[]> => {
+  const response = await api.get(ENDPOINTS.events.list);
+  const raw = Array.isArray(response.data)
+    ? response.data
+    : Array.isArray(response.data?.results)
+      ? response.data.results
+      : [];
+  return raw.map(normalizeEvent);
+};
+
+export const getEvent = getAllEvents;
+
+/**
+ * Détail d'un événement.
+ * Utilise un cache mémoire pour ne pas retenter un endpoint legacy qui 404.
+ */
+export const readEvent = async (
+  id: string,
+  category?: string,
+): Promise<NormalizedEvent> => {
+  if (!id) throw new Error("readEvent: id manquant");
+
+  const cachedResource = workingResourceCache.get(id);
+  if (cachedResource) {
+    try {
+      const response = await api.get(`/events/api/${cachedResource}/${id}/`);
+      return normalizeEvent(response.data);
+    } catch (err: any) {
+      if (err?.response?.status === 404) {
+        workingResourceCache.delete(id);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  if (category) {
+    const resource = resolveCategoryEndpoint(category);
+    try {
+      const response = await api.get(`/events/api/${resource}/${id}/`);
+      workingResourceCache.set(id, resource);
+      return normalizeEvent(response.data);
+    } catch (err: any) {
+      if (err?.response?.status !== 404) throw err;
+    }
+  }
+
+  const response = await api.get(ENDPOINTS.events.detail(id));
+  return normalizeEvent(response.data);
+};
+
+export const createEvent = async (formData: FormData) => {
+  const response = await api.post(ENDPOINTS.events.create, formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+  return response.data;
+};
+
+export const updateEvent = async (data: any, id: string, category?: string) => {
+  const resource = resolveCategoryEndpoint(category || data?.category || "");
+  const response = await api.put(`/events/api/${resource}/${id}/`, data);
+  return response.data;
+};
+
+// ✅ SUPPRESSION IDEMPOTENTE — utilise l'endpoint UNIFIÉ
+//    /events/<uuid>/ → UnifiedEventDetailView.delete → soft delete pour TOUS les types
+//    Cela évite l'erreur de routage "category" (anciens events sans catégorie
+//    qui tombaient sur ConferenceViewSet → 404 avalé comme succès → rien supprimé).
+export const supprimerEvent = async (
+  id: string,
+  _category?: string,
+): Promise<{ success: boolean; alreadyDeleted?: boolean }> => {
+  try {
+    await api.delete(`/events/${id}/`);
+    // Nettoyer le cache de lecture si l'event y était
+    workingResourceCache.delete(id);
+    return { success: true };
+  } catch (error: any) {
+    const status = error?.response?.status;
+
+    // 404 → l'événement n'existe plus côté serveur → idempotent
+    if (status === 404) {
+      console.log(`[supprimerEvent] 404 → déjà supprimé (${id})`);
+      workingResourceCache.delete(id);
+      return { success: true, alreadyDeleted: true };
+    }
+
+    // Network Error (timeout) → succès optimiste (règle actée)
+    if (!error?.response) {
+      console.warn(
+        `[supprimerEvent] Network Error (timeout probable) → considéré comme supprimé (${id})`,
+      );
+      workingResourceCache.delete(id);
+      return { success: true, alreadyDeleted: true };
+    }
+
+    // Toute autre erreur (403, 500…) remonte
+    throw error;
+  }
+};
+
+export const uploadImage = async (eventId: string, formData: FormData) => {
+  const response = await api.patch(
+    ENDPOINTS.events.uploadImage(eventId),
+    formData,
+    { headers: { "Content-Type": "multipart/form-data" } },
+  );
+  return response.data;
+};
+
+export const getSellerStats = async () => {
+  const response = await api.get(ENDPOINTS.events.sellerStats);
+  return response.data;
+};
+
+export const filterEventsByCategory = (
+  events: NormalizedEvent[],
+  category: EventCategory | "all",
+): NormalizedEvent[] => {
+  if (category === "all") return events;
+  return events.filter((e) => e.category === category);
+};
+
+export const countEventsByCategory = (
+  events: NormalizedEvent[],
+): Record<EventCategory, number> => {
+  const counts: Record<string, number> = {
+    mariage: 0,
+    birthday: 0,
+    concert: 0,
+    conference: 0,
+    default: 0,
+  };
+  events.forEach((e) => {
+    counts[e.category] = (counts[e.category] || 0) + 1;
+  });
+  return counts as Record<EventCategory, number>;
+};
+
+// ═══════════════════════════════════════════════════════════════
+// CORBEILLE (TRASH) — 48h
+// ═══════════════════════════════════════════════════════════════
+export interface TrashEvent {
+  id: string;
+  name: string;
+  category: string;
+  event_code: string | null;
+  deleted_at: string;
+  expires_at: string;
+  hours_remaining: number;
+  guests_created_count: number;
+}
+
+export interface TrashResponse {
+  count: number;
+  hidden_count: number;
+  retention_hours: number;
+  events: TrashEvent[];
+}
+
+export const getTrashEvents = async (): Promise<TrashResponse> => {
+  const response = await api.get("/events/trash/");
+  return response.data;
+};
+
+export const restoreEvent = async (
+  id: string,
+): Promise<{ success: boolean; message?: string; name?: string }> => {
+  try {
+    const response = await api.post(`/events/${id}/restore/`);
+    return response.data;
+  } catch (error: any) {
+    const status = error?.response?.status;
+    const body = error?.response?.data || {};
+    if (status === 400 || status === 404) {
+      return {
+        success: false,
+        message: body.error || "Restauration impossible.",
+      };
+    }
+    throw error;
+  }
+};
+
+export const hardDeleteEvent = async (
+  id: string,
+): Promise<{ success: boolean }> => {
+  try {
+    await api.delete(`/events/${id}/hard-delete/`);
+    return { success: true };
+  } catch (error: any) {
+    if (error?.response?.status === 404) {
+      return { success: true };
+    }
+    throw error;
+  }
+};
+
+// ✅ Vider la corbeille (rattrapage inclus)
+export interface EmptyTrashResponse {
+  success: boolean;
+  deleted: number;
+  per_model?: Record<string, number>;
+  message?: string;
+}
+
+export const emptyTrash = async (): Promise<EmptyTrashResponse> => {
+  try {
+    const response = await api.delete("/events/trash/empty/");
+    return response.data;
+  } catch (error: any) {
+    if (error?.response?.status === 404) {
+      return { success: true, deleted: 0, message: "Corbeille déjà vide." };
+    }
+    if (!error?.response) {
+      return { success: true, deleted: 0, message: "Réseau incertain." };
+    }
+    throw error;
+  }
+};
